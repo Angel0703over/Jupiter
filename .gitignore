@@ -1,0 +1,9 @@
+# 忽略所有以temp开头的文件和目录
+temp*
+# 忽略Python缓存目录
+__pycache__
+
+*.md
+
+# 忽略根目录 data 文件夹及其所有内容
+/data/
