@@ -8,6 +8,8 @@ import torch
 import torch.distributed as dist
 from . import threadsafe_queue,tag_manager
 
+STOP_SIGNAL = object()
+
 
 class CommunicationHandler():
     """Handles communication between stages."""
@@ -84,6 +86,10 @@ class CommunicationHandler():
 
     def stop_helper_threads(self):
         self.stop_event.set()
+        if hasattr(self, "forward_send_queues"):
+            self.forward_send_queues.add(STOP_SIGNAL)
+        if hasattr(self, "seq_len_send_queues"):
+            self.seq_len_send_queues.add(STOP_SIGNAL)
         
     def send(self, tensor, tag):
         if tag == self.tensor_tag["forward"]:
@@ -113,13 +119,19 @@ def recv_helper_thread(recv_queue, tensor_shape, src_rank, tag, dtype, stop_even
         tensor = _recv(tensor_shape, src_rank, tag, dtype)
 
         recv_queue.add(tensor)
+    print("[recv_helper_thread] thread exit", flush=True)
 
 
 def send_helper_thread(send_queue, dst_rank, tag, stop_event):
-    while not stop_event.is_set():  
-
+    while True:
         tensor = send_queue.remove()
-        _send(tensor, dst_rank, tag,)
+        if not torch.is_tensor(tensor):
+            if stop_event.is_set():
+                break
+            raise TypeError(
+                f"send_helper_thread expected torch.Tensor, got {type(tensor)!r}"
+            )
+        _send(tensor, dst_rank, tag)
 # TODO: Define backend (gloo), only supports CPU.
 def _send(tensor, dst_rank, tag ):
     if tensor.device != torch.device("cpu"):
@@ -132,4 +144,3 @@ def _recv(tensor_shape, src_rank, tag,dtype):
     tensor = torch.zeros(tensor_shape, dtype=dtype) 
     dist.recv(tensor, src=src_rank, tag=tag)
     return tensor
-

@@ -219,7 +219,10 @@ def outline_based_decoding( model,config,args ):
     model.set_mask_for_medusa_decoding()
     print(f"{args.rank}: set_mask_for_medusa_decoding done!", flush=True)
     runtime = DecodingPipeline(model, config, args)
-    # return
-    runtime.jupiter_decoding_pipeline()
-    runtime.comm_handler.stop_helper_threads()
+    try:
+        runtime.jupiter_decoding_pipeline()
+    finally:
+        runtime.comm_handler.stop_helper_threads()
+        if dist.is_initialized():
+            dist.barrier()
     print(f"{args.rank}: jupiter_decoding_pipeline", flush=True)

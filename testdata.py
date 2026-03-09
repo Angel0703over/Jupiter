@@ -1,4 +1,5 @@
 import argparse
+import gc
 import json
 import torch
 import torch.distributed as dist
@@ -12,13 +13,14 @@ from jupiter.utils import (
     normal_decoding,
     jupiter_prefilling_no_finish,
     point_prefilling,
-    outline_based_decoding
+    outline_based_decoding,
 )
 
 from tasks.medusa_llama.outline_decoding_controller import (
     get_controller,
     OutlineDecodingController,
-    set_controller
+    set_controller,
+    reset_controller,
 )
 from jupiter.prefilling_pipeline import PrefillingPipeline
 from jupiter.decoding_pipeline import DecodingPipeline
@@ -81,17 +83,17 @@ def init(args, init_dist=True):
 # Reset Context
 # ------------------------------------------------
 def reset_model_context(model, config):
-
     # reset model internal state
     if hasattr(model, "current_length_data"):
         model.current_length_data.zero_()
-
     if hasattr(model, "model"):
         model.model.medusa_mask = None
         model.model.medusa_mode = None
-
-    # stop helper threads if controller exists
-    OutlineDecodingController._instance = None  
+    # release point controller caches between queries
+    reset_controller()
+    if torch.cuda.is_available():
+        gc.collect()
+        torch.cuda.empty_cache()
     model.eval()
     if dist.is_initialized():
         print("rank", dist.get_rank(), "before barrier", flush=True)
@@ -99,8 +101,8 @@ def reset_model_context(model, config):
             f"rank {dist.get_rank()} active threads: {threading.enumerate()}",
             flush=True
         )
-        # dist.barrier()
-        # print("rank", dist.get_rank(), "after barrier", flush=True)
+        dist.barrier()
+        print("rank", dist.get_rank(), "after barrier", flush=True)
 
 # ------------------------------------------------
 # Load Dataset
@@ -182,6 +184,7 @@ def run_single_query(question, model, config, args,pefilling_runtime):
     print("outline_based_decoding done", flush=True)
 
     get_controller().get_output()
+    dist.barrier()
 
 # ------------------------------------------------
 # Main

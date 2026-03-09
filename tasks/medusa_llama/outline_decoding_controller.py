@@ -80,9 +80,31 @@ class OutlineDecodingController:
                     ) 
             print("********************\n",flush=True)
             print(self.points[i] + text,flush=True)
-global controller  
+    def release(self):
+        # Release references so CUDA memory can be reclaimed.
+        self.past_key_values_for_point = []
+        self.past_key_values_data_for_point = []
+        self.current_length_data_for_point = []
+        self.input_ids_for_point = []
+        self.input_len_for_point = []
+        self.is_finish = []
+        if hasattr(self, "request_queue"):
+            self.request_queue = None
+        self.points = []
+        self.point_num = 0
+
+
+controller = None
 def get_controller():
     return controller
 def set_controller(con):
     global controller
     controller = con
+
+
+def reset_controller():
+    global controller
+    if controller is not None and hasattr(controller, "release"):
+        controller.release()
+    controller = None
+    OutlineDecodingController._instance = None

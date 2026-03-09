@@ -132,16 +132,13 @@ class DecodingPipeline():
                 # ===== ROUND END: only last stage sends =====
                 if self.config.is_last_stage and idx == self.config.max_steps - 1:
                     print("[ROUND END] send ROUND_END_POINT_ID", flush=True)
-                    hidden_dim = select_indices_and_new_inputs_ids.shape[1]
-                    dummy = torch.zeros(
-                        1,
-                        hidden_dim + 1,
-                        device=select_indices_and_new_inputs_ids.device
-                    )
-                    dummy[0,0] = ROUND_END_POINT_ID
+                    dummy = torch.zeros_like(select_indices_and_new_inputs_ids)
                     self.new_token_send(dummy, ROUND_END_POINT_ID)
             else:
                 select_indices_and_new_inputs_ids, point_id = self.new_token_recv()
+                if point_id == ROUND_END_POINT_ID:
+                    print("[ROUND END] recv ROUND_END_POINT_ID", flush=True)
+                    break
                 new_token_len = select_indices_and_new_inputs_ids[0,0].item()
                 select_indices = select_indices_and_new_inputs_ids[:,1:new_token_len+1].view(-1)
                 new_input_ids = select_indices_and_new_inputs_ids[:, new_token_len+1:2*new_token_len+1]

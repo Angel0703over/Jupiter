@@ -18,6 +18,8 @@ from . import threadsafe_queue,tag_manager
 from .communication import recv_helper_thread,send_helper_thread
 
 ROUND_END_POINT_ID = -1
+STOP_SIGNAL = object()
+THREAD_JOIN_TIMEOUT_SEC = 20.0
 
 class CommunicationHandler():
     """Handles communication between stages."""
@@ -64,6 +66,7 @@ class CommunicationHandler():
         self.stop_event = threading.Event()
         # List to keep track of helper threads.
         self.helper_threads = []
+        self.round_end_sent = False
         self.start_helper_threads()
 
 
@@ -152,22 +155,58 @@ class CommunicationHandler():
 
 
     def start_helper_thread(self, func, args):
-        helper_thread = threading.Thread(target=func, args=args,daemon=True)
+        helper_thread = threading.Thread(target=func, args=args, daemon=True)
         helper_thread.start()
         self.helper_threads.append(helper_thread)  # Track the thread.
 
     def stop_helper_threads(self):
         print("[DecodingCommunicationHandler] stopping helper threads", flush=True)
 
+        # Mark local threads as stopping first.
         self.stop_event.set()
 
+        # Wake peer recv threads blocked in dist.recv / dist.broadcast.
+        if hasattr(self, "tree_candidates_send_queues"):
+            self.tree_candidates_send_queues.add(self._make_stop_payload("tree_candidates"))
+        if hasattr(self, "tree_decoding_send_queues"):
+            self.tree_decoding_send_queues.add(self._make_stop_payload("tree_decoding"))
+        if self.if_last_rank and hasattr(self, "new_token_send_queues") and not self.round_end_sent:
+            self.new_token_send_queues.add(self._make_round_end_payload())
+
+        # Wake local send threads blocked on queue.remove.
+        if hasattr(self, "tree_candidates_send_queues"):
+            self.tree_candidates_send_queues.add(STOP_SIGNAL)
+        if hasattr(self, "tree_decoding_send_queues"):
+            self.tree_decoding_send_queues.add(STOP_SIGNAL)
+        if hasattr(self, "new_token_send_queues"):
+            self.new_token_send_queues.add(STOP_SIGNAL)
+
+        alive_threads = []
         for thread in self.helper_threads:
             if thread.is_alive():
-                thread.join(timeout=1.0)
+                thread.join(timeout=THREAD_JOIN_TIMEOUT_SEC)
+            if thread.is_alive():
+                alive_threads.append(str(thread))
 
         self.helper_threads.clear()
 
+        if alive_threads:
+            print(f"[DecodingCommunicationHandler] still alive after stop: {alive_threads}", flush=True)
         print("[DecodingCommunicationHandler] stopped", flush=True)
+
+    def _make_stop_payload(self, tensor_name):
+        return torch.zeros(
+            self.tensor_shape_for_recv[tensor_name],
+            dtype=self.tensor_type[tensor_name],
+        )
+
+    def _make_round_end_payload(self):
+        tensor = torch.zeros(
+            self.tensor_shape_for_recv["new_token"],
+            dtype=self.tensor_type["new_token"],
+        )
+        tensor.view(-1)[0] = ROUND_END_POINT_ID
+        return tensor
         
     def flatten_before_send(self,tensor, point_id):
         flattened_tensor = tensor.reshape(1,-1)
@@ -192,6 +231,8 @@ class CommunicationHandler():
         elif tag == self.tensor_tag["tree_candidates"]:
             self.tree_candidates_send_queues.add(tensor)
         elif tag == self.tensor_tag["new_token"]:
+            if point_id == ROUND_END_POINT_ID:
+                self.round_end_sent = True
             self.new_token_send_queues.add(tensor)
         else:
             raise NotImplementedError
@@ -212,21 +253,25 @@ class CommunicationHandler():
     
 
 def broadcast_send_helper_thread(send_queue, src,stop_event):
-    while not stop_event.is_set():  
-        
+    while True:
         tensor = send_queue.remove()
-        _broadcast_send(tensor, src, )
+        if tensor is STOP_SIGNAL:
+            break
+        _broadcast_send(tensor, src)
 
 def broadcast_recv_helper_thread(recv_queue, tensor_shape, src_rank, dtype, stop_event):
     print("[broadcast_recv_helper_thread] started", flush=True)
 
-    while not stop_event.is_set():
+    while True:
         tensor = _broadcast_recv(tensor_shape, src_rank, dtype)
         point_id = int(tensor.view(-1)[0].item())
         if point_id == ROUND_END_POINT_ID:
             print("[broadcast_recv_helper_thread] round end received", flush=True)
-            continue
+            recv_queue.add(tensor)
+            break
         recv_queue.add(tensor)
+        if stop_event.is_set():
+            break
 
 def _broadcast_send(tensor, src_rank ):
     if tensor.device != torch.device("cpu"): # for gloo 
