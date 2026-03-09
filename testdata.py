@@ -6,6 +6,7 @@ import threading
 from tasks.medusa_llama.llama_config import LlamaConfig
 from tools.utils import initialize_distributed, get_model_type
 from tools.sot import get_skeleton_prompt, get_point_expanding_prompt
+from jupiter.prefilling_pipeline import PrefillingPipeline
 from jupiter.utils import (
     jupiter_prefilling,
     normal_decoding,
@@ -19,8 +20,9 @@ from tasks.medusa_llama.outline_decoding_controller import (
     OutlineDecodingController,
     set_controller
 )
-from jupiter.decoding_pipeline import DecodingPipeline
 from jupiter.prefilling_pipeline import PrefillingPipeline
+from jupiter.decoding_pipeline import DecodingPipeline
+
 
 # ------------------------------------------------
 # Model Init
@@ -87,8 +89,9 @@ def reset_model_context(model, config):
     if hasattr(model, "model"):
         model.model.medusa_mask = None
         model.model.medusa_mode = None
-    OutlineDecodingController._instance = None
+
     # stop helper threads if controller exists
+    OutlineDecodingController._instance = None  
     model.eval()
     if dist.is_initialized():
         print("rank", dist.get_rank(), "before barrier", flush=True)
@@ -114,19 +117,20 @@ def load_questions(dataset_path):
 # ------------------------------------------------
 # Main Inference
 # ------------------------------------------------
-def run_single_query(question, model, config, args, prefilling_runtime):
+def run_single_query(question, model, config, args,pefilling_runtime):
 
     print(f"\n==============================")
     print(f"[{args.rank}] Question: {question}", flush=True)
     prompt = get_skeleton_prompt(question)
     print("Start prefilling...", flush=True)
     medusa_logits, logits = jupiter_prefilling(
-        prefilling_runtime,
+        pefilling_runtime,
         tokenizer.encode(prompt, return_tensors="pt"),
         model,
         config,
         args,
     )
+
     answer = normal_decoding(prompt, model, config, medusa_logits, logits)
 
     skeleton = "\n".join([line.lstrip() for line in answer.splitlines()])
@@ -139,25 +143,15 @@ def run_single_query(question, model, config, args, prefilling_runtime):
 
     # shared prefix
     input_ids = tokenizer.encode(shared_prefix, return_tensors="pt")
-    jupiter_prefilling_no_finish(
-    prefilling_runtime,
-    input_ids,
-    model,
-    config,
-    args,
-    )
+    jupiter_prefilling_no_finish(pefilling_runtime,input_ids, model, config, args)
 
     dist.barrier()
 
     set_controller(OutlineDecodingController(points, config, model))
 
     medusa_logits_list, logits_list = point_prefilling(
-    prefilling_runtime,
-    prompts_for_points,
-    model,
-    config,
-    args,
-)
+        pefilling_runtime, prompts_for_points, model, config, args
+    )
 
     dist.barrier()
 
@@ -184,6 +178,7 @@ def run_single_query(question, model, config, args, prefilling_runtime):
     print("outline_based_decoding begin", flush=True)
 
     outline_based_decoding(model, config, args)
+
     print("outline_based_decoding done", flush=True)
 
     get_controller().get_output()
@@ -222,5 +217,4 @@ if __name__ == "__main__":
         print(f"[{args.rank}] Reset model context...", flush=True)
         reset_model_context(model, config)
     prefilling_runtime.comm_handler.stop_helper_threads()
-
     print(f"[{args.rank}] All queries finished!")

@@ -10,6 +10,7 @@ from . import threadsafe_queue,tag_manager
 
 
 class CommunicationHandler():
+    """Handles communication between stages."""
     def __init__(self, config):
         self.rank = config.stage
         self.world_size = config.total_stage
@@ -109,27 +110,16 @@ def recv_helper_thread(recv_queue, tensor_shape, src_rank, tag, dtype, stop_even
     print("[recv_helper_thread] started", flush=True)
 
     while not stop_event.is_set():
-        tensor = _recv(tensor_shape, src_rank, tag, dtype)  
+        tensor = _recv(tensor_shape, src_rank, tag, dtype)
+
         recv_queue.add(tensor)
-    print("[recv_helper_thread] thread exit", flush=True)
+
 
 def send_helper_thread(send_queue, dst_rank, tag, stop_event):
-    while True:
+    while not stop_event.is_set():  
+
         tensor = send_queue.remove()
-
-        # Allow queue-based stop sentinels from callers that cannot be unblocked
-        # by stop_event alone.
-        if not torch.is_tensor(tensor):
-            if stop_event.is_set():
-                break
-            raise TypeError(
-                f"send_helper_thread expected torch.Tensor, got {type(tensor)!r}"
-            )
-
-        _send(tensor, dst_rank, tag)
-
-        if stop_event.is_set():
-            break
+        _send(tensor, dst_rank, tag,)
 # TODO: Define backend (gloo), only supports CPU.
 def _send(tensor, dst_rank, tag ):
     if tensor.device != torch.device("cpu"):
@@ -142,3 +132,4 @@ def _recv(tensor_shape, src_rank, tag,dtype):
     tensor = torch.zeros(tensor_shape, dtype=dtype) 
     dist.recv(tensor, src=src_rank, tag=tag)
     return tensor
+

@@ -6,9 +6,9 @@ from jupiter.core.decoding_communication import CommunicationHandler
 import time
 from  tasks.medusa_llama.outline_decoding_controller  import get_controller   # [MODIFIED]
 from jupiter.core.decoding_communication import ROUND_END_POINT_ID
+
 class DecodingPipeline():
-    def __init__(self, stage_model, config, args):
-        print(f"DecodingPipeline.__init__ id={id(self)}", flush=True)
+    def __init__(self,  stage_model, config, args):
         self.config = config
         self.args = args
         self.stage = config.stage
@@ -17,7 +17,6 @@ class DecodingPipeline():
         self.total_stage = config.total_stage
         self.stage_model = stage_model
         self.comm_handler = CommunicationHandler(config)
-        print(f"DecodingPipeline comm_handler id={id(self.comm_handler)}", flush=True)
         
     def tree_decoding_send(self, tensor, point_id):
         assert self.stage != self.total_stage -1
