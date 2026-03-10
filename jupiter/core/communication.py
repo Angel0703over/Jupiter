@@ -59,28 +59,32 @@ class CommunicationHandler():
                                         self.pre_rank,
                                         self.tensor_tag["forward"],
                                         self.tensor_type["forward"],
-                                        self.stop_event))  # Pass stop_event
+                                        self.stop_event),
+                                    name="prefill_forward_recv_helper")  # Pass stop_event
             self.start_helper_thread(func=recv_helper_thread,
                                     args=(self.seq_len_receive_queues,
                                         self.tensor_shape["seq_len"],
                                         self.pre_rank,
                                         self.tensor_tag["seq_len"],
                                         self.tensor_type["seq_len"],
-                                        self.stop_event))
+                                        self.stop_event),
+                                    name="prefill_seq_len_recv_helper")
         if not self.if_last_rank:
             # Start send forward helper thread.
             self.start_helper_thread(func=send_helper_thread,
                                     args=(self.forward_send_queues, 
                                     self.next_rank,
                                     self.tensor_tag["forward"],
-                                    self.stop_event))  # Pass stop_event
+                                    self.stop_event),
+                                    name="prefill_forward_send_helper")  # Pass stop_event
             self.start_helper_thread(func=send_helper_thread, 
                                     args=(self.seq_len_send_queues, 
                                     self.next_rank,
                                     self.tensor_tag["seq_len"],
-                                    self.stop_event))
-    def start_helper_thread(self, func, args):
-        helper_thread = threading.Thread(target=func, args=args,daemon=True)
+                                    self.stop_event),
+                                    name="prefill_seq_len_send_helper")
+    def start_helper_thread(self, func, args, name=None):
+        helper_thread = threading.Thread(target=func, args=args, daemon=True, name=name)
         helper_thread.start()
         self.helper_threads.append(helper_thread)  # Track the thread.
 
@@ -113,20 +117,30 @@ class CommunicationHandler():
 
 
 def recv_helper_thread(recv_queue, tensor_shape, src_rank, tag, dtype, stop_event):
-    print("[recv_helper_thread] started", flush=True)
+    thread_name = threading.current_thread().name
+    print(
+        f"[recv_helper_thread:{thread_name}] started (tag={tag}, src={src_rank})",
+        flush=True,
+    )
 
     while not stop_event.is_set():
         tensor = _recv(tensor_shape, src_rank, tag, dtype)
 
         recv_queue.add(tensor)
-    print("[recv_helper_thread] thread exit", flush=True)
+    print(f"[recv_helper_thread:{thread_name}] thread exit", flush=True)
 
 
 def send_helper_thread(send_queue, dst_rank, tag, stop_event):
+    thread_name = threading.current_thread().name
+    print(
+        f"[send_helper_thread:{thread_name}] started (tag={tag}, dst={dst_rank})",
+        flush=True,
+    )
     while True:
         tensor = send_queue.remove()
         if not torch.is_tensor(tensor):
             if stop_event.is_set():
+                print(f"[send_helper_thread:{thread_name}] thread exit", flush=True)
                 break
             raise TypeError(
                 f"send_helper_thread expected torch.Tensor, got {type(tensor)!r}"

@@ -102,7 +102,8 @@ class CommunicationHandler():
                     self.world_size-1,
                     self.tensor_tag["tree_candidates"],
                     self.tensor_type["tree_candidates"],
-                    self.stop_event)
+                    self.stop_event),
+                name="decode_tree_candidates_recv_helper"
             )
 
         if self.if_last_rank:
@@ -111,7 +112,8 @@ class CommunicationHandler():
                 args=(self.tree_candidates_send_queues,
                     0,
                     self.tensor_tag["tree_candidates"],
-                    self.stop_event)
+                    self.stop_event),
+                name="decode_tree_candidates_send_helper"
             )
 
         # For tree decoding
@@ -123,7 +125,8 @@ class CommunicationHandler():
                     self.pre_rank,
                     self.tensor_tag["tree_decoding"],
                     self.tensor_type["tree_decoding"],
-                    self.stop_event)
+                    self.stop_event),
+                name="decode_tree_decoding_recv_helper"
             )
 
         if not self.if_last_rank:
@@ -132,7 +135,8 @@ class CommunicationHandler():
                 args=(self.tree_decoding_send_queues,
                     self.next_rank,
                     self.tensor_tag["tree_decoding"],
-                    self.stop_event)
+                    self.stop_event),
+                name="decode_tree_decoding_send_helper"
             )
 
         # For new token
@@ -141,7 +145,8 @@ class CommunicationHandler():
                 func=broadcast_send_helper_thread,
                 args=(self.new_token_send_queues,
                     self.world_size-1,
-                    self.stop_event)
+                    self.stop_event),
+                name="decode_new_token_broadcast_send_helper"
             )
         else:
             self.start_helper_thread(
@@ -150,12 +155,13 @@ class CommunicationHandler():
                     self.tensor_shape_for_recv["new_token"],
                     self.world_size-1,
                     self.tensor_type["new_token"],
-                    self.stop_event)
+                    self.stop_event),
+                name="decode_new_token_broadcast_recv_helper"
             )
 
 
-    def start_helper_thread(self, func, args):
-        helper_thread = threading.Thread(target=func, args=args, daemon=True)
+    def start_helper_thread(self, func, args, name=None):
+        helper_thread = threading.Thread(target=func, args=args, daemon=True, name=name)
         helper_thread.start()
         self.helper_threads.append(helper_thread)  # Track the thread.
 
@@ -253,25 +259,36 @@ class CommunicationHandler():
     
 
 def broadcast_send_helper_thread(send_queue, src,stop_event):
+    thread_name = threading.current_thread().name
+    print(f"[broadcast_send_helper_thread:{thread_name}] started", flush=True)
     while True:
         tensor = send_queue.remove()
         if tensor is STOP_SIGNAL:
+            print(f"[broadcast_send_helper_thread:{thread_name}] thread exit", flush=True)
             break
         _broadcast_send(tensor, src)
 
 def broadcast_recv_helper_thread(recv_queue, tensor_shape, src_rank, dtype, stop_event):
-    print("[broadcast_recv_helper_thread] started", flush=True)
+    thread_name = threading.current_thread().name
+    print(
+        f"[broadcast_recv_helper_thread:{thread_name}] started (src={src_rank})",
+        flush=True,
+    )
 
     while True:
         tensor = _broadcast_recv(tensor_shape, src_rank, dtype)
         point_id = int(tensor.view(-1)[0].item())
         if point_id == ROUND_END_POINT_ID:
-            print("[broadcast_recv_helper_thread] round end received", flush=True)
+            print(
+                f"[broadcast_recv_helper_thread:{thread_name}] round end received",
+                flush=True,
+            )
             recv_queue.add(tensor)
             break
         recv_queue.add(tensor)
         if stop_event.is_set():
             break
+    print(f"[broadcast_recv_helper_thread:{thread_name}] thread exit", flush=True)
 
 def _broadcast_send(tensor, src_rank ):
     if tensor.device != torch.device("cpu"): # for gloo 
