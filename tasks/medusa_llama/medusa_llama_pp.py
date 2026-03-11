@@ -563,7 +563,24 @@ class PPMedusaLlamaForCausalLM(LlamaPreTrainedModel):
         else:
             assert tree_candidates == None
             assert tree_candidates_embeds != None
-        position_ids =  self.medusa_buffers["medusa_position_ids"] + input_ids.shape[1]
+        debug_kv = os.getenv("JUPITER_KV_DEBUG", "1") == "1"
+        if kwargs.get("is_point"):
+            point_id = kwargs.get("point_id")
+            controller = get_controller()
+            if controller is None:
+                raise RuntimeError(f"[KV][tree_decoding] controller is None for point={point_id}")
+            point_len = int(controller.get_point_current_length_data(point_id).max().item())
+            shared_len = int(self.current_length_data.max().item())
+            kv_prefix_len = shared_len + point_len
+        else:
+            kv_prefix_len = int(self.current_length_data.max().item())
+        input_len = int(input_ids.shape[1])
+        if debug_kv and kv_prefix_len != input_len:
+            print(
+                f"[KV][tree_decoding] prefix mismatch input_len={input_len} kv_prefix_len={kv_prefix_len}",
+                flush=True,
+            )
+        position_ids = self.medusa_buffers["medusa_position_ids"] + kv_prefix_len
         if  self.config.is_last_stage:
             tree_medusa_logits, outputs, tree_logits = self(
                     input_ids = tree_candidates,
@@ -665,12 +682,41 @@ class PPMedusaLlamaForCausalLM(LlamaPreTrainedModel):
             dst.copy_(tgt, non_blocking=True)
             self.current_length_data.fill_(prev_input_len + tgt.shape[-2])
         else:
-            shared_len = int (self.current_length_data[0].item()) # shared kv cache length
-            prev_input_len = input_ids.shape[1] - shared_len # point kv cache pre length
             point_id = kwargs["point_id"]
-            point_past_key_values_data = get_controller().get_point_past_key_values_data(point_id)
-            point_current_length_data = get_controller().get_point_current_length_data(point_id)
+            controller = get_controller()
+            if controller is None:
+                raise RuntimeError(f"[KV][point][non_last] controller is None for point={point_id}")
+            if controller is not None and hasattr(controller, "get_shared_prefix_len"):
+                shared_len = int(controller.get_shared_prefix_len(point_id))
+            else:
+                shared_len = int(self.current_length_data[0].item())
+            prev_input_len = input_ids.shape[1] - shared_len
+            if prev_input_len < 0:
+                raise RuntimeError(
+                    f"[KV][point][non_last] invalid prev_input_len: point={point_id}, "
+                    f"input_ids_len={int(input_ids.shape[1])}, shared_len={shared_len}, "
+                    f"prev_input_len={prev_input_len}"
+                )
+            point_past_key_values_data = controller.get_point_past_key_values_data(point_id)
+            point_current_length_data = controller.get_point_current_length_data(point_id)
+            point_len_before_update = int(point_current_length_data.max().item())
+            if select_indices.numel() > 0:
+                min_idx = int(select_indices.min().item())
+                max_idx = int(select_indices.max().item())
+                if min_idx < 0 or max_idx >= point_len_before_update:
+                    raise RuntimeError(
+                        f"[KV][point][non_last] invalid select_indices: point={point_id}, "
+                        f"min_idx={min_idx}, max_idx={max_idx}, point_len_before_update={point_len_before_update}, "
+                        f"prev_input_len={prev_input_len}"
+                    )
             tgt = point_past_key_values_data[..., select_indices, :]
+            if prev_input_len + tgt.shape[-2] > point_past_key_values_data.shape[-2]:
+                raise RuntimeError(
+                    f"[KV][point][non_last] write overflow before copy: point={point_id}, "
+                    f"prev_input_len={prev_input_len}, copy_len={int(tgt.shape[-2])}, "
+                    f"capacity={int(point_past_key_values_data.shape[-2])}, "
+                    f"input_ids_len={int(input_ids.shape[1])}, shared_len={shared_len}"
+                )
             dst = point_past_key_values_data [..., prev_input_len : prev_input_len + tgt.shape[-2], :]
             dst.copy_(tgt, non_blocking=True)
             point_current_length_data.fill_(prev_input_len + tgt.shape[-2])

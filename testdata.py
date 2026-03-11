@@ -1,6 +1,7 @@
 import argparse
 import gc
 import json
+import os
 import torch
 import torch.distributed as dist
 import threading
@@ -89,7 +90,28 @@ def reset_model_context(model, config):
     if hasattr(model, "model"):
         model.model.medusa_mask = None
         model.model.medusa_mode = None
+        # 清理每层 attention cache
+    #     if hasattr(model.model, "layers"):
+    #         for layer in model.model.layers:
+    #             if hasattr(layer, "self_attn"):
+    #                 attn = layer.self_attn
+    #                 if hasattr(attn, "past_key_value"):
+    #                     attn.past_key_value = None
+    #                 if hasattr(attn, "point_past_key_value"):
+    #                     attn.point_past_key_value = None
+
+    #                 if hasattr(attn, "shared_past_key_value"):
+    #                     attn.shared_past_key_value = None
+
+
+    # if hasattr(model, "past_key_values"):
+    #     model.past_key_values = None
+
+    # if hasattr(model, "point_past_key_values"):
+    #     model.point_past_key_values = None
+
     # release point controller caches between queries
+
     reset_controller()
     if torch.cuda.is_available():
         gc.collect()
@@ -120,6 +142,8 @@ def load_questions(dataset_path):
 # Main Inference
 # ------------------------------------------------
 def run_single_query(question, model, config, args,pefilling_runtime):
+    show_text_output = os.getenv("JUPITER_SHOW_TEXT_OUTPUT", "0") == "1"
+    max_points = int(os.getenv("JUPITER_MAX_POINTS", "10"))
 
     print(f"\n==============================")
     print(f"[{args.rank}] Question: {question}", flush=True)
@@ -137,11 +161,27 @@ def run_single_query(question, model, config, args,pefilling_runtime):
 
     skeleton = "\n".join([line.lstrip() for line in answer.splitlines()])
 
-    print(f"[{args.rank}] skeleton:\n{skeleton}", flush=True)
+
+    if show_text_output:
+        print(f"[{args.rank}] skeleton:\n{skeleton}", flush=True)
+    else:
+        print(f"[{args.rank}] skeleton lines: {len(skeleton.splitlines())}", flush=True)
 
     points, shared_prefix, prompts_for_points = get_point_expanding_prompt(
         skeleton, question
     )
+    points = points[:max_points]
+    prompts_for_points = prompts_for_points[:max_points]
+
+    if dist.is_initialized():
+        src_rank = config.total_stage - 1
+        payload = [None]
+        if config.is_last_stage:
+            payload[0] = (points, shared_prefix, prompts_for_points)
+        dist.broadcast_object_list(payload, src=src_rank)
+        points, shared_prefix, prompts_for_points = payload[0]
+
+    print(f"[{args.rank}] point count: {len(points)}", flush=True)
 
     # shared prefix
     input_ids = tokenizer.encode(shared_prefix, return_tensors="pt")
@@ -183,7 +223,10 @@ def run_single_query(question, model, config, args,pefilling_runtime):
 
     print("outline_based_decoding done", flush=True)
 
-    get_controller().get_output()
+    if show_text_output:
+        get_controller().get_output()
+    else:
+        print(f"[{args.rank}] skip expanded text output (set JUPITER_SHOW_TEXT_OUTPUT=1 to enable)", flush=True)
     dist.barrier()
 
 # ------------------------------------------------

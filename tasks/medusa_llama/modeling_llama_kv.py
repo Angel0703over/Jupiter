@@ -6,6 +6,7 @@
 
 """ PyTorch LLaMA model."""
 import math
+import os
 from typing import List, Optional, Tuple, Union
 
 import torch
@@ -197,6 +198,18 @@ def apply_rotary_pos_emb(q, k, cos, sin, position_ids):
     # The first two dimensions of cos and sin are always 1, so we can `squeeze` them.
     cos = cos.squeeze(1).squeeze(0)  # [seq_len, dim]
     sin = sin.squeeze(1).squeeze(0)  # [seq_len, dim]
+    if position_ids.device != cos.device:
+        position_ids = position_ids.to(cos.device, non_blocking=True)
+    if position_ids.dtype != torch.long:
+        position_ids = position_ids.long()
+    pos_min = int(position_ids.min().item())
+    pos_max = int(position_ids.max().item())
+    cos_len = int(cos.shape[0])
+    if pos_min < 0 or pos_max >= cos_len:
+        raise RuntimeError(
+            f"[RoPE] position_ids out of range: min={pos_min}, max={pos_max}, "
+            f"cos_len={cos_len}, q_shape={tuple(q.shape)}, k_shape={tuple(k.shape)}"
+        )
     cos = cos[position_ids].unsqueeze(1)  # [bs, 1, seq_len, dim]
     sin = sin[position_ids].unsqueeze(1)  # [bs, 1, seq_len, dim]
     q_embed = (q * cos) + (rotate_half(q) * sin)
@@ -359,9 +372,21 @@ class LlamaAttention(nn.Module):
                 point_past_key_value = point_past_key_values[layer_id]
                 # new_len = point_past_key_value[0].shape[-2]
                 kv_seq_len += point_past_key_value[0].shape[-2]
-             
+        required_rope_seq_len = kv_seq_len
+        if position_ids is not None:
+            pos_min = int(position_ids.min().item())
+            pos_max = int(position_ids.max().item())
+            if pos_min < 0:
+                raise RuntimeError(f"[RoPE] negative position id detected: min={pos_min}, max={pos_max}")
+            required_rope_seq_len = max(required_rope_seq_len, pos_max + 1)
+            if os.getenv("JUPITER_KV_DEBUG", "1") == "1" and required_rope_seq_len != kv_seq_len:
+                print(
+                    f"[RoPE] extend rotary cache kv_seq_len={kv_seq_len} -> required={required_rope_seq_len} "
+                    f"(pos_max={pos_max})",
+                    flush=True,
+                )
 
-        cos, sin = self.rotary_emb(value_states, seq_len=kv_seq_len)
+        cos, sin = self.rotary_emb(value_states, seq_len=required_rope_seq_len)
         query_states, key_states = apply_rotary_pos_emb(query_states, key_states, cos, sin, position_ids)
         
         # [MODIFIED] Using KVCache mechanism for preallocated GPU memory optimization
@@ -466,7 +491,15 @@ class LlamaFlashAttention2(LlamaAttention):
         if past_key_value is not None:
             kv_seq_len += past_key_value[0].shape[-2]
 
-        cos, sin = self.rotary_emb(value_states, seq_len=kv_seq_len)
+        required_rope_seq_len = kv_seq_len
+        if position_ids is not None:
+            pos_min = int(position_ids.min().item())
+            pos_max = int(position_ids.max().item())
+            if pos_min < 0:
+                raise RuntimeError(f"[RoPE] negative position id detected: min={pos_min}, max={pos_max}")
+            required_rope_seq_len = max(required_rope_seq_len, pos_max + 1)
+
+        cos, sin = self.rotary_emb(value_states, seq_len=required_rope_seq_len)
 
         query_states, key_states = apply_rotary_pos_emb(query_states, key_states, cos, sin, position_ids)
 

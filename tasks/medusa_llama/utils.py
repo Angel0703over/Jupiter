@@ -1,8 +1,37 @@
 import torch
 import torch.nn.functional as F
 from  tasks.medusa_llama.outline_decoding_controller  import get_controller   # [MODIFIED]
+import os
 
 TOPK=10 # Top-k for sparse tree (10 is a placeholder and it is sufficient).
+
+
+def _sanitize_logits_and_candidates(logits, candidates):
+    debug = os.getenv("JUPITER_KV_DEBUG", "1") == "1"
+    if logits.dim() != 3:
+        raise RuntimeError(f"[Posterior] invalid logits dim={logits.dim()}, expected 3")
+    if candidates.dim() != 2:
+        raise RuntimeError(f"[Posterior] invalid candidates dim={candidates.dim()}, expected 2")
+
+    if candidates.dtype != torch.long:
+        candidates = candidates.to(torch.long)
+
+    logits = torch.nan_to_num(logits, nan=-1e4, posinf=1e4, neginf=-1e4)
+    vocab_size = int(logits.shape[-1])
+    candidate_tokens = candidates[:, 1:]
+    invalid_candidate_mask = (candidate_tokens < 0) | (candidate_tokens >= vocab_size)
+    if invalid_candidate_mask.any() and debug:
+        bad_values = candidate_tokens[invalid_candidate_mask][:8].detach().cpu().tolist()
+        bad_min = int(candidate_tokens.min().item())
+        bad_max = int(candidate_tokens.max().item())
+        print(
+            f"[Posterior][warn] invalid candidate token id detected: "
+            f"min={bad_min}, max={bad_max}, vocab_size={vocab_size}, sample={bad_values}",
+            flush=True,
+        )
+
+    safe_candidate_tokens = candidate_tokens.clamp(0, vocab_size - 1)
+    return logits, candidates, safe_candidate_tokens, invalid_candidate_mask
 
 def pad_path(path, length, pad_value=-2):
     """
@@ -367,6 +396,7 @@ def get_nucleus_posterior_mask(logits, candidates, temperature, top_p):
     # Adapted from https://github.com/huggingface/transformers/blob/18a879f47576822aa1a5c49aecb27d89bfa5fa69/examples/run_generation.py#L79
 
     # Apply temperature.
+    logits = torch.nan_to_num(logits, nan=-1e4, posinf=1e4, neginf=-1e4)
     logits = logits[:, :-1] / temperature
     n_samples, n_tokens = logits.shape[0], logits.shape[1]
     logits = logits.view(n_samples*n_tokens, -1)
@@ -394,7 +424,12 @@ def get_nucleus_posterior_mask(logits, candidates, temperature, top_p):
     # Remove low-probability tokens
     logits[indices_to_remove] = float('-inf')
     # Sample from the remaining tokens
-    sampled_tokens = torch.multinomial(F.softmax(logits, dim=-1), 1)
+    probs = F.softmax(logits, dim=-1)
+    invalid_rows = ~torch.isfinite(probs).all(dim=-1) | (probs.sum(dim=-1) <= 0)
+    if invalid_rows.any():
+        probs[invalid_rows] = 0
+        probs[invalid_rows, 0] = 1
+    sampled_tokens = torch.multinomial(probs, 1)
     sampled_tokens = sampled_tokens.view(n_samples, n_tokens)
     # Create a mask for selected tokens
     posterior_mask = (candidates[:, 1:] == sampled_tokens).int()
@@ -413,6 +448,7 @@ def get_typical_posterior_mask(logits, candidates, temperature, posterior_thresh
     Returns:
         torch.Tensor: A posterior mask indicating which candidate tokens match the sampled tokens.
     """
+    logits = torch.nan_to_num(logits, nan=-1e4, posinf=1e4, neginf=-1e4)
     logits = logits[:, :-1] / temperature
     n_samples, n_tokens = logits.shape[0], logits.shape[1]
     logits = logits.view(n_samples*n_tokens, -1)
@@ -426,7 +462,12 @@ def get_typical_posterior_mask(logits, candidates, temperature, posterior_thresh
         )
     indices_to_remove = probs < threshold.unsqueeze(-1)
     logits[indices_to_remove] = float('-inf')
-    sampled_tokens = torch.multinomial(F.softmax(logits, dim=-1), 1)
+    probs = F.softmax(logits, dim=-1)
+    invalid_rows = ~torch.isfinite(probs).all(dim=-1) | (probs.sum(dim=-1) <= 0)
+    if invalid_rows.any():
+        probs[invalid_rows] = 0
+        probs[invalid_rows, 0] = 1
+    sampled_tokens = torch.multinomial(probs, 1)
     sampled_tokens = sampled_tokens.view(n_samples, n_tokens)
     posterior_mask = (candidates[:, 1:] == sampled_tokens).int()
     return posterior_mask
@@ -455,6 +496,11 @@ def evaluate_posterior(
     - best_candidate (torch.Tensor): Index of the chosen best candidate.
     - accept_length (int): Length of the accepted candidate sequence.
     """
+    logits, candidates, safe_candidate_tokens, invalid_candidate_mask = _sanitize_logits_and_candidates(
+        logits,
+        candidates,
+    )
+
     # Greedy decoding based on temperature value
     if temperature == 0:
         # Find the tokens that match the maximum logits for each position in the sequence
@@ -475,8 +521,10 @@ def evaluate_posterior(
         if fast:
             posterior_prob = torch.softmax(logits[:, :-1] / temperature, dim=-1)
             candidates_prob = torch.gather(
-                posterior_prob, dim=-1, index=candidates[:, 1:].unsqueeze(-1)
+                posterior_prob, dim=-1, index=safe_candidate_tokens.unsqueeze(-1)
             ).squeeze(-1)
+            if invalid_candidate_mask.any():
+                candidates_prob = candidates_prob.masked_fill(invalid_candidate_mask, 0)
             posterior_entropy = -torch.sum(
                 posterior_prob * torch.log(posterior_prob + 1e-5), dim=-1
             )  # torch.sum(torch.log(*)) is faster than torch.prod
@@ -501,7 +549,9 @@ def evaluate_posterior(
                 best_candidate = best_candidates[torch.argmax(likelihood)]
             return best_candidate, accept_length
         # Calculate posterior probabilities and thresholds for candidate selection
-        posterior_mask = get_typical_posterior_mask(logits, candidates, temperature, posterior_threshold, posterior_alpha, fast)
+        posterior_mask = get_typical_posterior_mask(logits, candidates, temperature, posterior_threshold, posterior_alpha)
+        if invalid_candidate_mask.any():
+            posterior_mask = posterior_mask.masked_fill(invalid_candidate_mask, 0)
         candidates_accept_length = (torch.cumprod(posterior_mask, dim=1)).sum(dim=1)
         # Choose the best candidate based on the evaluated posterior probabilities
         accept_length = candidates_accept_length.max()
@@ -517,6 +567,8 @@ def evaluate_posterior(
     if sampling == 'nucleus':
         assert top_p < 1.0 + 1e-6, "top_p should between 0 and 1"
         posterior_mask = get_nucleus_posterior_mask(logits, candidates, temperature, top_p)
+        if invalid_candidate_mask.any():
+            posterior_mask = posterior_mask.masked_fill(invalid_candidate_mask, 0)
         candidates_accept_length = (torch.cumprod(posterior_mask, dim=1)).sum(dim=1)
         accept_length = candidates_accept_length.max()
         # Choose the best candidate
@@ -594,8 +646,20 @@ def update_inference_inputs(
         return input_ids, logits, medusa_logits, new_token,select_indices
     else:
         point_id = kwargs["point_id"]
-        shared_len = int (current_length_data[0].item()) # shared kv cache length
-        prev_input_len = input_ids.shape[1] - shared_len # point kv cache pre length
+        controller = get_controller()
+        if controller is None:
+            raise RuntimeError(f"[KV][point] controller is None for point={point_id}")
+        if controller is not None and hasattr(controller, "get_shared_prefix_len"):
+            shared_len = int(controller.get_shared_prefix_len(point_id))
+        else:
+            shared_len = int(current_length_data[0].item())
+        prev_input_len = input_ids.shape[1] - shared_len
+        if prev_input_len < 0:
+            raise RuntimeError(
+                f"[KV][point] invalid prev_input_len: point={point_id}, "
+                f"input_ids_len={int(input_ids.shape[1])}, shared_len={shared_len}, "
+                f"prev_input_len={prev_input_len}, accept_length={int(accept_length)}"
+            )
         # 用于修改point_kv_cache 需要减去最初share_kv_cache_len
         select_indices = (
             retrieve_indices[best_candidate, : accept_length + 1] + prev_input_len
@@ -604,9 +668,26 @@ def update_inference_inputs(
             [input_ids, candidates[None, best_candidate, : accept_length + 1]], dim=-1
         )
         # Update the point past key values based on the selected tokens
-        point_past_key_values_data = get_controller().get_point_past_key_values_data(point_id)
-        point_current_length_data = get_controller().get_point_current_length_data(point_id)
+        point_past_key_values_data = controller.get_point_past_key_values_data(point_id)
+        point_current_length_data = controller.get_point_current_length_data(point_id)
+        point_len_before_update = int(point_current_length_data.max().item())
+        if select_indices.numel() > 0:
+            min_idx = int(select_indices.min().item())
+            max_idx = int(select_indices.max().item())
+            if min_idx < 0 or max_idx >= point_len_before_update:
+                raise RuntimeError(
+                    f"[KV][point] invalid select_indices: point={point_id}, "
+                    f"min_idx={min_idx}, max_idx={max_idx}, point_len_before_update={point_len_before_update}, "
+                    f"prev_input_len={prev_input_len}, accept_length={int(accept_length)}"
+                )
         tgt = point_past_key_values_data[..., select_indices, :]
+        if prev_input_len + tgt.shape[-2] > point_past_key_values_data.shape[-2]:
+            raise RuntimeError(
+                f"[KV][point] write overflow before copy: point={point_id}, "
+                f"prev_input_len={prev_input_len}, copy_len={int(tgt.shape[-2])}, "
+                f"capacity={int(point_past_key_values_data.shape[-2])}, "
+                f"input_ids_len={int(input_ids.shape[1])}, shared_len={shared_len}"
+            )
         dst = point_past_key_values_data[..., prev_input_len : prev_input_len + tgt.shape[-2], :]
         dst.copy_(tgt, non_blocking=True)
         # Update the current length tensor (currently only support batch size is 1) for point kv cache

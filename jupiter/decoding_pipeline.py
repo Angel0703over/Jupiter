@@ -6,6 +6,7 @@ from jupiter.core.decoding_communication import CommunicationHandler
 import time
 from  tasks.medusa_llama.outline_decoding_controller  import get_controller   # [MODIFIED]
 from jupiter.core.decoding_communication import ROUND_END_POINT_ID
+import os
 
 class DecodingPipeline():
     def __init__(self,  stage_model, config, args):
@@ -49,22 +50,65 @@ class DecodingPipeline():
                 'is_point': True,
                 'point_id': 0,
                 } 
+        controller = get_controller()
+        debug_kv = os.getenv("JUPITER_KV_DEBUG", "1") == "1"
+        max_kv_cache_length = getattr(
+            self.config,
+            "max_kv_cache_length",
+            getattr(self.config, "max_position_embeddings", None),
+        )
+        point_kv_cache_length = None
+        if controller is not None and hasattr(controller, "get_point_kv_cache_length"):
+            point_kv_cache_length = int(controller.get_point_kv_cache_length())
+        if max_kv_cache_length is None:
+            point_kv_limit = point_kv_cache_length
+        elif point_kv_cache_length is None:
+            point_kv_limit = int(max_kv_cache_length)
+        else:
+            point_kv_limit = min(int(max_kv_cache_length), point_kv_cache_length)
+        tree_decode_window = self.comm_handler.tensor_shape["tree_decoding"][1]
         for idx in range(  self.config.max_steps):
             # print("=========================================\n")
             # print("step {}".format(idx),flush=True)
             # step 1: get request (medusa_logits and logits) from request queue and then generate_candidates
             new_token=0 # no use
             if self.config.is_last_stage:
-                request = get_controller().get_request()
+                if controller.all_points_finish():
+                    print("[ROUND END] all points finished", flush=True)
+                    dummy = torch.zeros(
+                        self.comm_handler.tensor_shape["new_token"],
+                        dtype=self.comm_handler.tensor_type["new_token"],
+                    )
+                    self.new_token_send(dummy, ROUND_END_POINT_ID)
+                    break
+                request = controller.get_active_request(
+                    point_kv_limit,
+                    tree_decode_window,
+                )
+                if request is None:
+                    print("[ROUND END] no active request", flush=True)
+                    dummy = torch.zeros(
+                        self.comm_handler.tensor_shape["new_token"],
+                        dtype=self.comm_handler.tensor_type["new_token"],
+                    )
+                    self.new_token_send(dummy, ROUND_END_POINT_ID)
+                    break
+                if debug_kv:
+                    req_point = request["point_id"]
+                    req_len = int(controller.get_point_current_length_data(req_point).max().item())
+                    print(
+                        f"[KV][step={idx}] picked point={req_point} point_len={req_len}",
+                        flush=True,
+                    )
                 candidates, tree_candidates = self.stage_model.generate_candidates(
                     request["medusa_logits"], 
                     request["logits"], 
                 )
-                input_ids = get_controller().get_input_ids( request["point_id"] )
+                input_ids = controller.get_input_ids(request["point_id"])
                 self.tree_candidates_send(tree_candidates, request["point_id"] )
             if self.config.is_first_stage:
                 tree_candidates, point_id = self.tree_candidates_recv()
-                input_ids = get_controller().get_input_ids( point_id)
+                input_ids = controller.get_input_ids(point_id)
             # Step 2: tree decoding
             if self.config.is_first_stage:
                 if  self.config.is_last_stage:
@@ -79,7 +123,7 @@ class DecodingPipeline():
                 self.tree_decoding_send(hidden_states,point_id)
             else:
                 hidden_states, point_id = self.tree_decoding_recv()
-                input_ids = get_controller().get_input_ids(point_id)
+                input_ids = controller.get_input_ids(point_id)
                 extra_kwargs["point_id"]=point_id
                 if not self.config.is_last_stage:
                     hidden_states = self.stage_model.tree_decoding(
@@ -113,22 +157,45 @@ class DecodingPipeline():
                 )  
                 new_input_ids = input_ids[:,  -select_indices.shape[0]:]
                 # update input_ids request
-                get_controller().update_input_ids(input_ids,point_id)
-                input_len = get_controller().get_input_len(point_id)
-                if self.stage_model.tokenizer.eos_token_id in input_ids[0, input_len:]:
+                controller.update_input_ids(input_ids,point_id)
+                input_len = controller.get_input_len(point_id)
+                point_finished = self.stage_model.tokenizer.eos_token_id in input_ids[0, input_len:]
+                point_current_len = int(controller.get_point_current_length_data(point_id).max().item())
+                point_reached_kv_limit = (
+                    point_kv_limit is not None
+                    and point_current_len >= (point_kv_limit - tree_decode_window)
+                )
+                if point_finished:
                     print("Point: {} Finish".format(point_id),flush=True)
-                # get_controller().set_point_finish(point_id)
-                # self.comm_handler.stop_helper_threads()
-                #     print("Point: {} finish".format(point_id))
-                # else:
-                #     # update request
-                get_controller().add_request(medusa_logits,logits,point_id)
+                if point_reached_kv_limit:
+                    print(
+                        "Point: {} Reach KV limit current_len={}".format(
+                            point_id,
+                            point_current_len,
+                        ),
+                        flush=True,
+                    )
+                if debug_kv:
+                    print(
+                        f"[KV][step={idx}] point={point_id} len={point_current_len} "
+                        f"finished={point_finished} reach_limit={point_reached_kv_limit}",
+                        flush=True,
+                    )
+                if point_finished or point_reached_kv_limit:
+                    controller.set_point_finish(point_id)
+                else:
+                    controller.add_request(medusa_logits,logits,point_id)
                 # TODO: Determine if finished.
             # Step 4: In Step 3, self.stage_model.update_inference_inputs updated the kvcache of the last stage. Now synchronize the decoding results and update the kv cache and inputs_ids of other stages.
             if  self.config.is_last_stage:
                 new_token_len =  torch.tensor(select_indices.shape)
                 select_indices_and_new_inputs_ids = torch.cat((new_token_len.unsqueeze(0), select_indices.unsqueeze(0).cpu(), new_input_ids.cpu()), dim=1)
                 self.new_token_send(select_indices_and_new_inputs_ids,point_id)
+                if controller.all_points_finish():
+                    print("[ROUND END] all points finished", flush=True)
+                    dummy = torch.zeros_like(select_indices_and_new_inputs_ids)
+                    self.new_token_send(dummy, ROUND_END_POINT_ID)
+                    break
                 # ===== ROUND END: only last stage sends =====
                 if self.config.is_last_stage and idx == self.config.max_steps - 1:
                     print("[ROUND END] send ROUND_END_POINT_ID", flush=True)
@@ -146,7 +213,7 @@ class DecodingPipeline():
                 self.stage_model.update_kv_cache(input_ids,select_indices,**extra_kwargs)
                 input_ids = torch.cat([input_ids, new_input_ids], dim=-1    ) # Must be executed after update_kv_cache.
                 # update input_ids
-                get_controller().update_input_ids(input_ids,point_id)
-                input_len = get_controller().get_input_len(point_id)
+                controller.update_input_ids(input_ids,point_id)
+                input_len = controller.get_input_len(point_id)
                 if self.stage_model.tokenizer.eos_token_id in input_ids[0, input_len:]:
                     print("Point: {} Finish".format(point_id),flush=True)

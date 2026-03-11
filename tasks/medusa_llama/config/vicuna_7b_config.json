@@ -41,5 +41,5 @@
   "torch_dtype": "bfloat16",
   "num_sub_sequences":5,
   "sub_sequence_length":256,
-  "max_kv_cache_length": 2048
+  "max_kv_cache_length": 4096
 }

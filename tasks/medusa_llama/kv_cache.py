@@ -60,6 +60,21 @@ class KVCache:
         Returns:
             torch.Tensor: The data tensor after concatenation up to the current length.
         """
+        current = int(self.current_length.item())
+        append_len = int(tensor.shape[dim])
+        capacity = int(self.data.shape[dim])
+        next_len = current + append_len
+        if next_len > capacity:
+            raise RuntimeError(
+                "[KVCache.cat] overflow: "
+                f"current={current}, append_len={append_len}, next={next_len}, capacity={capacity}"
+            )
+        if next_len >= (capacity - append_len):
+            print(
+                "[KVCache.cat] near capacity: "
+                f"current={current}, append_len={append_len}, next={next_len}, capacity={capacity}",
+                flush=True,
+            )
         dst = self.data.narrow(dim, self.current_length, tensor.shape[dim])
         dst.copy_(tensor)
         self.current_length.add_(tensor.shape[dim])
@@ -68,7 +83,7 @@ class KVCache:
     def get_states(self):
         return torch.narrow(self.data, 2, 0, self.current_length)
 
-def initialize_past_key_values(model):
+def initialize_past_key_values(model, max_length_override=None):
     """
     Initialize past key and value states for a given transformer model.
 
@@ -93,7 +108,9 @@ def initialize_past_key_values(model):
         # [modified]
         config.num_hidden_layers = config.num_pp_hidden_layers
     print("num_hidden_layers", config.num_hidden_layers)
-    if hasattr(config, "max_kv_cache_length"):
+    if max_length_override is not None:
+        max_length = int(max_length_override)
+    elif hasattr(config, "max_kv_cache_length"):
         max_length = config.max_kv_cache_length
     else:
         max_length = config.max_position_embeddings
@@ -137,4 +154,3 @@ def get_shared_kv_and_point_kv( shared_past_key_value,point_past_key_value):
     combined_key_states = torch.cat((share_key_states, point_key_states), dim=2)
     combined_value_states = torch.cat((share_value_states, point_value_states), dim=2)
     return combined_key_states, combined_value_states
-
