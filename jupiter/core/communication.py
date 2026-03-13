@@ -16,6 +16,16 @@ THREAD_JOIN_POLL_INTERVAL_SEC = 0.05
 THREAD_JOIN_TIMEOUT_SEC = 20.0
 IRECV_WAIT_TIMEOUT_MS = 20
 
+def _is_peer_closed_error(exc: RuntimeError) -> bool:
+    message = str(exc)
+    markers = (
+        "Connection closed by peer",
+        "Application timeout caused pair closure",
+        "pair closure",
+        "Connection reset by peer",
+    )
+    return any(marker in message for marker in markers)
+
 
 class CommunicationHandler():
     """Handles communication between stages."""
@@ -149,14 +159,23 @@ def recv_helper_thread(
     )
 
     while not stop_event.is_set():
-        tensor = _recv(
-            tensor_shape,
-            src_rank,
-            tag,
-            dtype,
-            stop_event,
-            use_async_recv=use_async_recv,
-        )
+        try:
+            tensor = _recv(
+                tensor_shape,
+                src_rank,
+                tag,
+                dtype,
+                stop_event,
+                use_async_recv=use_async_recv,
+            )
+        except RuntimeError as exc:
+            if _is_peer_closed_error(exc):
+                print(
+                    f"[recv_helper_thread:{thread_name}] peer closed (tag={tag}, src={src_rank}), exit",
+                    flush=True,
+                )
+                break
+            raise
 
         recv_queue.add(tensor)
     print(f"[recv_helper_thread:{thread_name}] thread exit", flush=True)
@@ -177,7 +196,16 @@ def send_helper_thread(send_queue, dst_rank, tag, stop_event):
             raise TypeError(
                 f"send_helper_thread expected torch.Tensor, got {type(tensor)!r}"
             )
-        _send(tensor, dst_rank, tag)
+        try:
+            _send(tensor, dst_rank, tag)
+        except RuntimeError as exc:
+            if _is_peer_closed_error(exc):
+                print(
+                    f"[send_helper_thread:{thread_name}] peer closed (tag={tag}, dst={dst_rank}), exit",
+                    flush=True,
+                )
+                break
+            raise
 # TODO: Define backend (gloo), only supports CPU.
 def _send(tensor, dst_rank, tag ):
     if tensor.device != torch.device("cpu"):
