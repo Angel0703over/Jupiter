@@ -1,10 +1,60 @@
 from .prefilling_pipeline import PrefillingPipeline
 from .decoding_pipeline import DecodingPipeline
 import time
+import os
+from datetime import timedelta
 import torch
 import copy
 import torch.distributed as dist
 from .core.tag_manager   import Tag
+
+
+def _dist_recv_with_timeout(tensor, src, tag, stage_name):
+    timeout_sec = float(os.getenv("JUPITER_DIST_OP_TIMEOUT_SEC", "0"))
+    if timeout_sec <= 0:
+        dist.recv(tensor=tensor, src=src, tag=tag)
+        return
+
+    work = dist.irecv(tensor=tensor, src=src, tag=tag)
+    deadline = time.time() + timeout_sec
+    while True:
+        remaining = deadline - time.time()
+        if remaining <= 0:
+            raise RuntimeError(
+                f"[dist-timeout] recv timeout in {stage_name}: src={src}, tag={tag}, timeout={timeout_sec}s"
+            )
+        wait_ms = max(1, min(1000, int(remaining * 1000)))
+        try:
+            work.wait(timeout=timedelta(milliseconds=wait_ms))
+        except RuntimeError as exc:
+            if "Timed out waiting" not in str(exc):
+                raise
+        if work.is_completed():
+            return
+
+
+def _dist_broadcast_with_timeout(tensor, src, stage_name):
+    timeout_sec = float(os.getenv("JUPITER_DIST_OP_TIMEOUT_SEC", "0"))
+    if timeout_sec <= 0:
+        dist.broadcast(tensor=tensor, src=src)
+        return
+
+    work = dist.broadcast(tensor=tensor, src=src, async_op=True)
+    deadline = time.time() + timeout_sec
+    while True:
+        remaining = deadline - time.time()
+        if remaining <= 0:
+            raise RuntimeError(
+                f"[dist-timeout] broadcast timeout in {stage_name}: src={src}, timeout={timeout_sec}s"
+            )
+        wait_ms = max(1, min(1000, int(remaining * 1000)))
+        try:
+            work.wait(timeout=timedelta(milliseconds=wait_ms))
+        except RuntimeError as exc:
+            if "Timed out waiting" not in str(exc):
+                raise
+        if work.is_completed():
+            return
 
 def jupiter_prefilling(prefilling_runtime, input_ids, model, config, args):
     # Prefilling with sequence slicing.
@@ -107,9 +157,12 @@ def normal_decoding(prompt,model,config,medusa_logits=None,logits=None,input_ids
         if config.is_first_stage:
             recv_tensor = torch.zeros(tensor_shape["tree_candidates"],
                                     dtype=tensor_type["tree_candidates"]) # int64
-            # print("start to recv 1", flush=True)
-            dist.recv(tensor=recv_tensor, src= config.total_stage-1, tag= tensor_tag["tree_candidates"])
-            # print("finish recv 1", flush=True)
+            _dist_recv_with_timeout(
+                tensor=recv_tensor,
+                src=config.total_stage-1,
+                tag=tensor_tag["tree_candidates"],
+                stage_name=f"normal_decoding.step1.tree_candidates.idx={idx}",
+            )
             if config.device == "cuda":
                 tree_candidates = recv_tensor.to("cuda")
             else:
@@ -141,7 +194,12 @@ def normal_decoding(prompt,model,config,medusa_logits=None,logits=None,input_ids
         else:
             # TODO: candidates:torch.Size([42, 5]) tree_candidates torch.Size([1, 64]) Size may vary with different medusa choices.
             recv_tensor = torch.zeros(tensor_shape["tree_decoding"], dtype=  tensor_type["tree_decoding"])
-            dist.recv(tensor=recv_tensor, src= config.pre_rank, tag= tensor_tag["tree_decoding"])
+            _dist_recv_with_timeout(
+                tensor=recv_tensor,
+                src=config.pre_rank,
+                tag=tensor_tag["tree_decoding"],
+                stage_name=f"normal_decoding.step2.tree_decoding.idx={idx}",
+            )
             if config.device == "cuda":
                 hidden_states = recv_tensor.to("cuda")
             else:
@@ -189,10 +247,18 @@ def normal_decoding(prompt,model,config,medusa_logits=None,logits=None,input_ids
             new_token_len =  torch.tensor(select_indices.shape)
             # Concatenate three parts with total length 1+2*new_token_len, new_token_length <= config.medusa_num_heads.
             select_indices_and_new_inputs_ids = torch.cat((new_token_len.unsqueeze(0), select_indices.unsqueeze(0).cpu(), new_input_ids.cpu()), dim=1)
-            dist.broadcast(select_indices_and_new_inputs_ids,  src= config.total_stage-1)
+            _dist_broadcast_with_timeout(
+                tensor=select_indices_and_new_inputs_ids,
+                src=config.total_stage-1,
+                stage_name=f"normal_decoding.step4.new_token_send.idx={idx}",
+            )
         else:
             recv_tensor = torch.zeros(tensor_shape["new_token"],   dtype= tensor_type["new_token"]) # Maximum length 11.
-            dist.broadcast(recv_tensor,   src= config.total_stage-1)
+            _dist_broadcast_with_timeout(
+                tensor=recv_tensor,
+                src=config.total_stage-1,
+                stage_name=f"normal_decoding.step4.new_token_recv.idx={idx}",
+            )
             if config.device == "cuda":
                 select_indices_and_new_inputs_ids = recv_tensor.cuda()
             else:
@@ -223,6 +289,4 @@ def outline_based_decoding( model,config,args ):
         runtime.jupiter_decoding_pipeline()
     finally:
         runtime.comm_handler.stop_helper_threads()
-        if dist.is_initialized():
-            dist.barrier()
     print(f"{args.rank}: jupiter_decoding_pipeline", flush=True)

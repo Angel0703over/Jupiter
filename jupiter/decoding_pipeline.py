@@ -44,6 +44,26 @@ class DecodingPipeline():
         assert not self.comm_handler.if_last_rank
         tensor,point_id = self.comm_handler.recv(self.comm_handler.tensor_tag["new_token"])
         return tensor,point_id
+
+    def _send_round_end(self, reason, new_token_template=None):
+        assert self.config.is_last_stage
+        print(f"[ROUND END] {reason}", flush=True)
+
+        if new_token_template is None:
+            round_end_new_token = torch.zeros(
+                self.comm_handler.tensor_shape["new_token"],
+                dtype=self.comm_handler.tensor_type["new_token"],
+            )
+        else:
+            round_end_new_token = torch.zeros_like(new_token_template)
+        self.new_token_send(round_end_new_token, ROUND_END_POINT_ID)
+
+        round_end_tree_candidates = torch.zeros(
+            self.comm_handler.tensor_shape["tree_candidates"],
+            dtype=self.comm_handler.tensor_type["tree_candidates"],
+        )
+        self.tree_candidates_send(round_end_tree_candidates, ROUND_END_POINT_ID)
+
     def jupiter_decoding_pipeline(self):
         # Use point_id to select point_kv_cache in forward computation or modify point_kv_cache based on selected token.
         extra_kwargs = {
@@ -74,24 +94,14 @@ class DecodingPipeline():
             new_token=0 # no use
             if self.config.is_last_stage:
                 if controller.all_points_finish():
-                    print("[ROUND END] all points finished", flush=True)
-                    dummy = torch.zeros(
-                        self.comm_handler.tensor_shape["new_token"],
-                        dtype=self.comm_handler.tensor_type["new_token"],
-                    )
-                    self.new_token_send(dummy, ROUND_END_POINT_ID)
+                    self._send_round_end("all points finished")
                     break
                 request = controller.get_active_request(
                     point_kv_limit,
                     tree_decode_window,
                 )
                 if request is None:
-                    print("[ROUND END] no active request", flush=True)
-                    dummy = torch.zeros(
-                        self.comm_handler.tensor_shape["new_token"],
-                        dtype=self.comm_handler.tensor_type["new_token"],
-                    )
-                    self.new_token_send(dummy, ROUND_END_POINT_ID)
+                    self._send_round_end("no active request")
                     break
                 if debug_kv:
                     req_point = request["point_id"]
@@ -108,6 +118,9 @@ class DecodingPipeline():
                 self.tree_candidates_send(tree_candidates, request["point_id"] )
             if self.config.is_first_stage:
                 tree_candidates, point_id = self.tree_candidates_recv()
+                if point_id == ROUND_END_POINT_ID:
+                    print("[ROUND END] recv ROUND_END_POINT_ID from tree_candidates", flush=True)
+                    break
                 input_ids = controller.get_input_ids(point_id)
             # Step 2: tree decoding
             if self.config.is_first_stage:
@@ -192,15 +205,18 @@ class DecodingPipeline():
                 select_indices_and_new_inputs_ids = torch.cat((new_token_len.unsqueeze(0), select_indices.unsqueeze(0).cpu(), new_input_ids.cpu()), dim=1)
                 self.new_token_send(select_indices_and_new_inputs_ids,point_id)
                 if controller.all_points_finish():
-                    print("[ROUND END] all points finished", flush=True)
-                    dummy = torch.zeros_like(select_indices_and_new_inputs_ids)
-                    self.new_token_send(dummy, ROUND_END_POINT_ID)
+                    self._send_round_end(
+                        "all points finished",
+                        new_token_template=select_indices_and_new_inputs_ids,
+                    )
                     break
                 # ===== ROUND END: only last stage sends =====
                 if self.config.is_last_stage and idx == self.config.max_steps - 1:
-                    print("[ROUND END] send ROUND_END_POINT_ID", flush=True)
-                    dummy = torch.zeros_like(select_indices_and_new_inputs_ids)
-                    self.new_token_send(dummy, ROUND_END_POINT_ID)
+                    self._send_round_end(
+                        "send ROUND_END_POINT_ID",
+                        new_token_template=select_indices_and_new_inputs_ids,
+                    )
+                    break
             else:
                 select_indices_and_new_inputs_ids, point_id = self.new_token_recv()
                 if point_id == ROUND_END_POINT_ID:

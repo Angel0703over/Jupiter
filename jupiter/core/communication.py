@@ -4,11 +4,17 @@ and add them to the forward and backward task queues.
 """
 
 import threading
+import time
+from datetime import timedelta
 import torch
 import torch.distributed as dist
 from . import threadsafe_queue,tag_manager
 
 STOP_SIGNAL = object()
+IRECV_POLL_INTERVAL_SEC = 0.001
+THREAD_JOIN_POLL_INTERVAL_SEC = 0.05
+THREAD_JOIN_TIMEOUT_SEC = 20.0
+IRECV_WAIT_TIMEOUT_MS = 20
 
 
 class CommunicationHandler():
@@ -94,6 +100,17 @@ class CommunicationHandler():
             self.forward_send_queues.add(STOP_SIGNAL)
         if hasattr(self, "seq_len_send_queues"):
             self.seq_len_send_queues.add(STOP_SIGNAL)
+        deadline = time.time() + THREAD_JOIN_TIMEOUT_SEC
+        alive_threads = []
+        for thread in self.helper_threads:
+            while thread.is_alive() and time.time() < deadline:
+                thread.join(timeout=THREAD_JOIN_POLL_INTERVAL_SEC)
+                time.sleep(0)
+            if thread.is_alive():
+                alive_threads.append(str(thread))
+        self.helper_threads.clear()
+        if alive_threads:
+            print(f"[CommunicationHandler] still alive after stop: {alive_threads}", flush=True)
         
     def send(self, tensor, tag):
         if tag == self.tensor_tag["forward"]:
@@ -116,7 +133,15 @@ class CommunicationHandler():
         return tensor
 
 
-def recv_helper_thread(recv_queue, tensor_shape, src_rank, tag, dtype, stop_event):
+def recv_helper_thread(
+    recv_queue,
+    tensor_shape,
+    src_rank,
+    tag,
+    dtype,
+    stop_event,
+    use_async_recv=False,
+):
     thread_name = threading.current_thread().name
     print(
         f"[recv_helper_thread:{thread_name}] started (tag={tag}, src={src_rank})",
@@ -124,7 +149,14 @@ def recv_helper_thread(recv_queue, tensor_shape, src_rank, tag, dtype, stop_even
     )
 
     while not stop_event.is_set():
-        tensor = _recv(tensor_shape, src_rank, tag, dtype)
+        tensor = _recv(
+            tensor_shape,
+            src_rank,
+            tag,
+            dtype,
+            stop_event,
+            use_async_recv=use_async_recv,
+        )
 
         recv_queue.add(tensor)
     print(f"[recv_helper_thread:{thread_name}] thread exit", flush=True)
@@ -154,7 +186,24 @@ def _send(tensor, dst_rank, tag ):
 
 
 
-def _recv(tensor_shape, src_rank, tag,dtype):
-    tensor = torch.zeros(tensor_shape, dtype=dtype) 
-    dist.recv(tensor, src=src_rank, tag=tag)
+def _recv(tensor_shape, src_rank, tag, dtype, stop_event, use_async_recv=False):
+    tensor = torch.zeros(tensor_shape, dtype=dtype)
+    if not use_async_recv:
+        dist.recv(tensor, src=src_rank, tag=tag)
+        return tensor
+    work = dist.irecv(tensor, src=src_rank, tag=tag)
+    wait_timeout = timedelta(milliseconds=IRECV_WAIT_TIMEOUT_MS)
+    while True:
+        try:
+            work.wait(timeout=wait_timeout)
+        except RuntimeError as exc:
+            # Gloo may raise on timeout instead of returning False.
+            if "Timed out waiting" not in str(exc):
+                raise
+        if work.is_completed():
+            break
+        if stop_event.is_set():
+            time.sleep(0)
+        else:
+            time.sleep(IRECV_POLL_INTERVAL_SEC)
     return tensor

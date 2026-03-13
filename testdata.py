@@ -2,6 +2,7 @@ import argparse
 import gc
 import json
 import os
+from datetime import timedelta
 import torch
 import torch.distributed as dist
 import threading
@@ -25,6 +26,21 @@ from tasks.medusa_llama.outline_decoding_controller import (
 )
 from jupiter.prefilling_pipeline import PrefillingPipeline
 from jupiter.decoding_pipeline import DecodingPipeline
+
+
+def sync_ranks(label):
+    if not dist.is_initialized():
+        return
+    if os.getenv("JUPITER_ENABLE_SYNC", "1") != "1":
+        return
+    timeout_sec = int(os.getenv("JUPITER_SYNC_TIMEOUT_SEC", "180"))
+    rank = dist.get_rank()
+    print(f"rank {rank} before sync: {label}", flush=True)
+    if hasattr(dist, "monitored_barrier") and dist.get_backend() == "gloo":
+        dist.monitored_barrier(timeout=timedelta(seconds=timeout_sec))
+    else:
+        dist.barrier()
+    print(f"rank {rank} after sync: {label}", flush=True)
 
 
 # ------------------------------------------------
@@ -118,13 +134,13 @@ def reset_model_context(model, config):
         torch.cuda.empty_cache()
     model.eval()
     if dist.is_initialized():
-        print("rank", dist.get_rank(), "before barrier", flush=True)
+        rank = dist.get_rank()
+        print("rank", rank, "before reset sync", flush=True)
         print(
-            f"rank {dist.get_rank()} active threads: {threading.enumerate()}",
+            f"rank {rank} active threads: {threading.enumerate()}",
             flush=True
         )
-        dist.barrier()
-        print("rank", dist.get_rank(), "after barrier", flush=True)
+    sync_ranks("after_reset_model_context")
 
 # ------------------------------------------------
 # Load Dataset
@@ -187,7 +203,7 @@ def run_single_query(question, model, config, args,pefilling_runtime):
     input_ids = tokenizer.encode(shared_prefix, return_tensors="pt")
     jupiter_prefilling_no_finish(pefilling_runtime,input_ids, model, config, args)
 
-    dist.barrier()
+    sync_ranks("after_shared_prefix_prefill")
 
     set_controller(OutlineDecodingController(points, config, model))
 
@@ -195,7 +211,7 @@ def run_single_query(question, model, config, args,pefilling_runtime):
         pefilling_runtime, prompts_for_points, model, config, args
     )
 
-    dist.barrier()
+    sync_ranks("after_point_prefill")
 
     if config.is_last_stage:
         get_controller().add_requests(medusa_logits_list, logits_list)
@@ -215,7 +231,7 @@ def run_single_query(question, model, config, args,pefilling_runtime):
 
     get_controller().set_up_input_ids_for_point(input_ids_for_point)
 
-    dist.barrier()
+    sync_ranks("before_outline_decoding")
 
     print("outline_based_decoding begin", flush=True)
 
@@ -227,7 +243,7 @@ def run_single_query(question, model, config, args,pefilling_runtime):
         get_controller().get_output()
     else:
         print(f"[{args.rank}] skip expanded text output (set JUPITER_SHOW_TEXT_OUTPUT=1 to enable)", flush=True)
-    dist.barrier()
+    sync_ranks("after_outline_output")
 
 # ------------------------------------------------
 # Main

@@ -27,3 +27,9 @@ class Queue:
         length =  len(self.queue)
         self.cond.release()
         return length
+
+    def clear(self):
+        self.cond.acquire()
+        self.queue.clear()
+        self.cond.notify_all()
+        self.cond.release()
